@@ -107,6 +107,22 @@ namespace {
                                        llvm::SmallVectorImpl<char>& Buf,
                                        AdditionalArgList& Args,
                                        bool Verbose) {
+    // let's see if the path is available as a predefined env variable
+    // (saves system calls)
+    auto PrefCppSystemIncl = getenv("ROOT_CPPSYSINCL");
+    if (PrefCppSystemIncl != nullptr) {
+      llvm::StringRef Paths(PrefCppSystemIncl);
+      llvm::SmallVector<StringRef,10> Tokens;
+      Paths.split(Tokens,":");
+      for (auto& T : Tokens) {
+	T = T.trim();
+        // cling::log() << " Adding external include path " << T.str() << "\n";
+        Args.addArgument("-cxx-isystem", T.str());
+      }
+      return;
+    }
+
+    // execute default dynamic search
     std::string CppInclQuery("LC_ALL=C ");
     CppInclQuery.append(Compiler);
 
@@ -127,8 +143,10 @@ namespace {
             if (Verbose)
               cling::utils::LogNonExistantDirectory(Path);
           }
-          else
+          else {
+	    // cling::log() << " Adding system path " << Path.str() << "\n";
             Args.addArgument("-cxx-isystem", Path.str());
+	  }
         }
       }
       ::pclose(PF);
