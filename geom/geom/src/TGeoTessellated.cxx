@@ -353,6 +353,7 @@ void TGeoTessellated::CloseShape(bool check, bool fixFlipped, bool verbose)
       fClosedBody = CheckClosure(fixFlipped, verbose);
    }
    BuildBVH();
+   BuildEmbreeGeometry();
    CalculateNormals();
    fIsClosed = true;
 }
@@ -890,6 +891,12 @@ inline Vec3f<T> triangleNormal(const Vec3f<T> &a, const Vec3f<T> &b, const Vec3f
 Double_t TGeoTessellated::DistFromOutside(const Double_t *point, const Double_t *dir, Int_t iact, Double_t stepmax,
                                           Double_t *safe) const
 {
+#ifdef ROOT_GEOM_EMBREE
+   if (fUseEmbree) {
+      return DistFromOutside_Embree(point, dir, stepmax);
+   }
+#endif
+
    // use the BVH intersector in combination with leaf ray-triangle testing
    double local_step = Big(); // we need this otherwise the lambda get's confused
 
@@ -973,6 +980,11 @@ Double_t TGeoTessellated::DistFromOutside(const Double_t *point, const Double_t 
 Double_t TGeoTessellated::DistFromInside(const Double_t *point, const Double_t *dir, Int_t iact, Double_t stepmax,
                                          Double_t *safe) const
 {
+#ifdef ROOT_GEOM_EMBREE
+   if (fUseEmbree) {
+     return DistFromInside_Embree(point, dir, stepmax);
+   }
+#endif
    // use the BVH intersector in combination with leaf ray-triangle testing
    double local_step = Big(); // we need this otherwise the lambda get's confused
 
@@ -1120,6 +1132,11 @@ void TGeoTessellated::BuildBVH()
 
 bool TGeoTessellated::Contains(Double_t const *point) const
 {
+#ifdef ROOT_GEOM_EMBREE
+   if (fUseEmbree) {
+     return Contains_Embree(point);
+   }
+#endif
    // we do the parity test
    using Scalar = float;
    using Vec3 = bvh::v2::Vec<Scalar, 3>;
@@ -1164,6 +1181,9 @@ bool TGeoTessellated::Contains(Double_t const *point) const
    mybvh->intersect<false, use_robust_traversal>(ray, mybvh->get_root().index, stack, [&](size_t begin, size_t end) {
       for (size_t prim_id = begin; prim_id < end; ++prim_id) {
          auto objectid = mybvh->prim_ids[prim_id];
+
+         // std::cerr << "Intersect cand " << objectid << "\n";
+
          auto &facet = fFacets[objectid];
 
          // for the parity test, we probe all crossing surfaces
@@ -1174,6 +1194,7 @@ bool TGeoTessellated::Contains(Double_t const *point) const
          const double t = rayTriangle(Vertex_t(point[0], point[1], point[2]),
                                       Vertex_t(test_dir[0], test_dir[1], test_dir[2]), v0, v1, v2, 0.);
 
+         // std::cerr << " dist " << t << "\n";
          if (t != std::numeric_limits<double>::infinity()) {
             ++crossings;
          }
@@ -1536,3 +1557,361 @@ void TGeoTessellated::CalculateNormals()
       fOutwardNormals.emplace_back(Vertex_t{norm.x, norm.y, norm.z});
    }
 }
+
+
+#ifdef ROOT_GEOM_EMBREE
+
+#include <embree4/rtcore.h>
+
+// helper function to return the singleton Embree device (shared within a process)
+RTCDevice GetEmbreeDevice()
+{
+  static RTCDevice device = [] {
+    RTCDevice d = rtcNewDevice(nullptr);
+    if (!d) {
+      throw std::runtime_error("Failed to create Embree device");
+    }
+    return d;
+  }();
+  return device;
+}
+
+RTCScene CreateScene()
+{
+  RTCDevice device = GetEmbreeDevice();
+  RTCScene scene = rtcNewScene(device);
+  // this influences the quality of the BVH, since the BVH
+  // is created on the level of a scene
+  rtcSetSceneBuildQuality(scene, RTC_BUILD_QUALITY_HIGH);
+  rtcSetSceneFlags(scene, RTC_SCENE_FLAG_ROBUST);
+  return scene;
+}
+
+void TGeoTessellated::BuildEmbreeGeometry()
+{
+  if (getenv("USE_EMBREE")) {
+    fUseEmbree = true;
+  }
+  // get hold of the static device
+  auto device = GetEmbreeDevice();
+
+  // construct a triangle geometry from the tessellated facets
+  // (taken from existing code in VecGeom)
+  RTCGeometry geom = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
+  rtcSetGeometryUserData(geom, (void*)&fIntersCandidates);
+  auto scene  = CreateScene();
+
+  unsigned int meshID;
+  rtcSetGeometryBuildQuality(geom, RTC_BUILD_QUALITY_HIGH);
+  rtcSetGeometryTimeStepCount(geom, 1);
+  meshID = rtcAttachGeometry(scene, geom);
+  std::cerr << "MeshID is " << meshID;
+
+  struct Vertex {
+    float x, y, z, r; // 3D position + color (needed by Embree)
+  };
+  struct Triangle {
+    int v0, v1, v2;
+  };
+
+  // determine number of vertices and triangles
+  int ntriangles = GetNfacets();
+  int nvertices  = 3 * ntriangles; // for now, don't care about degeneracies (to be looked into)
+
+  // allocate the triangle index and vertex buffers
+  Vertex *vertices    = (Vertex *)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
+                                                          4 * sizeof(float), nvertices);
+  Triangle *triangles = (Triangle *)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
+                                                            3 * sizeof(int), ntriangles);
+
+  // loop over all tessellated triangles and add them to the embree buffer
+  int vertexcounter = 0;
+  for (int t = 0; t < ntriangles; ++t) {
+    const auto& facet = fFacets[t];
+    
+    const auto& v0 = fVertices[facet[0]];
+    vertices[vertexcounter].x = v0.x();
+    vertices[vertexcounter].y = v0.y();
+    vertices[vertexcounter].z = v0.z();
+    triangles[t].v0           = vertexcounter;
+    vertexcounter++;
+    
+    const auto& v1 = fVertices[facet[1]];
+    vertices[vertexcounter].x = v1.x();
+    vertices[vertexcounter].y = v1.y();
+    vertices[vertexcounter].z = v1.z();
+    triangles[t].v1           = vertexcounter;
+    vertexcounter++;
+
+    const auto& v2 = fVertices[facet[2]];
+    vertices[vertexcounter].x = v2.x();
+    vertices[vertexcounter].y = v2.y();
+    vertices[vertexcounter].z = v2.z();
+    triangles[t].v2           = vertexcounter;
+    vertexcounter++;
+  }
+  
+  // enable filter callbacks
+  rtcSetGeometryEnableFilterFunctionFromArguments(geom, true);
+
+  rtcCommitGeometry(geom);
+  rtcReleaseGeometry(geom);
+  rtcCommitScene(scene);
+
+  fEmbreeScene_ptr = (void*)scene;
+
+  return; // geom;
+}
+
+Double_t TGeoTessellated::DistFromInside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax) const 
+{
+  RTCRayHit ray;
+  memset(&ray, 0, sizeof(ray));
+  ray.ray.flags = 0;
+  ray.ray.org_x = point[0];
+  ray.ray.org_y = point[1];
+  ray.ray.org_z = point[2];
+  ray.ray.dir_x = dir[0];
+  ray.ray.dir_y = dir[1];
+  ray.ray.dir_z = dir[2];
+  ray.ray.tnear = 0.f;
+  ray.ray.tfar = std::numeric_limits<float>::infinity();
+  ray.ray.mask = -1;
+  ray.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+  ray.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+  
+  auto scene = (RTCScene) fEmbreeScene_ptr;
+  RTCIntersectArguments iargs;  
+  rtcInitIntersectArguments(&iargs);
+  
+  iargs.filter = [](const RTCFilterFunctionNArguments* args) {
+     // extract intersection info
+     assert(args->N == 1);
+     const auto& h = args->hit;
+     const auto objID = RTCHitN_primID(h, 1, 0);
+     auto candidates = (std::vector<int>*)(args->geometryUserPtr);
+     candidates->push_back(objID);
+  };
+
+  iargs.feature_mask = RTC_FEATURE_FLAG_ALL;
+  fIntersCandidates.clear();
+  rtcTraversableIntersect1(rtcGetSceneTraversable(scene), &ray, &iargs); 
+  
+  // at this moment we have the (few) candidates and we need to check them 
+  // in double precision
+  double dist = Big();
+  for (auto& primID : fIntersCandidates) {
+   const auto& facet = fFacets[primID];
+   const auto& n = fOutwardNormals[primID];
+   
+   // do the quick right side of triangle check
+   if (n[0] * dir[0] + n[1] * dir[1] + n[2] * dir[2] <= 0.) {
+     continue;
+   }
+   
+   // do the final ray-triangle Intersection in double
+   const auto& v0 = fVertices[facet[0]];
+   const auto& v1 = fVertices[facet[1]];
+   const auto& v2 = fVertices[facet[2]];
+   auto this_dist = rayTriangle(Vertex_t{point[0], point[1], point[2]}, 
+                                Vertex_t{dir[0], dir[1], dir[2]}, v0, v1, v2, 0.0);
+   if (this_dist < dist) {
+     dist = this_dist;
+   }
+  }
+  return dist;
+}
+
+Double_t TGeoTessellated::DistFromOutside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax) const 
+{
+  RTCRayHit ray;
+  memset(&ray, 0, sizeof(ray));
+  ray.ray.flags = 0;
+  ray.ray.org_x = point[0];
+  ray.ray.org_y = point[1];
+  ray.ray.org_z = point[2];
+  ray.ray.dir_x = dir[0];
+  ray.ray.dir_y = dir[1];
+  ray.ray.dir_z = dir[2];
+  ray.ray.tnear = 0.f;
+  ray.ray.tfar = (stepmax < Big()) ? stepmax : std::numeric_limits<float>::infinity();
+  ray.ray.mask = -1;
+  ray.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+  ray.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+  
+  auto scene = (RTCScene) fEmbreeScene_ptr;
+  RTCIntersectArguments iargs;  
+  rtcInitIntersectArguments(&iargs);
+  
+  iargs.filter = [](const RTCFilterFunctionNArguments* args) {
+     // extract intersection info
+     assert(args->N == 1);
+     const auto& h = args->hit;
+     const auto objID = RTCHitN_primID(h, 1, 0);
+     auto candidates = (std::vector<int>*)(args->geometryUserPtr);
+     candidates->push_back(objID);
+  };
+
+  iargs.feature_mask = RTC_FEATURE_FLAG_ALL;
+  fIntersCandidates.clear();
+  rtcTraversableIntersect1(rtcGetSceneTraversable(scene), &ray, &iargs); 
+  
+  // at this moment we have the (few) candidates and we need to check them 
+  // in double precision
+  double dist = Big();
+  for (auto& primID : fIntersCandidates) {
+   const auto& facet = fFacets[primID];
+   const auto& n = fOutwardNormals[primID];
+   
+   // do the quick right side of triangle check
+   if (n[0] * dir[0] + n[1] * dir[1] + n[2] * dir[2] > 0.) {
+     continue;
+   }
+   
+   // do the final ray-triangle Intersection in double precision
+   const auto& v0 = fVertices[facet[0]];
+   const auto& v1 = fVertices[facet[1]];
+   const auto& v2 = fVertices[facet[2]];
+   auto this_dist = rayTriangle(Vertex_t{point[0], point[1], point[2]}, 
+                                Vertex_t{dir[0], dir[1], dir[2]}, v0, v1, v2, 0.0);
+   if (this_dist < dist) {
+     dist = this_dist;
+   }
+  }
+  return dist;
+}
+
+bool TGeoTessellated::Contains_Embree(const Double_t *point) const 
+{
+  if (!TGeoBBox::Contains(point)) {
+    return false;
+  }
+  Vertex_t test_dir{1.0, 1.41421356237, 1.73205080757};
+
+  RTCRayHit ray;
+  memset(&ray, 0, sizeof(ray));
+  ray.ray.flags = 0;
+  ray.ray.org_x = point[0];
+  ray.ray.org_y = point[1];
+  ray.ray.org_z = point[2];
+  ray.ray.dir_x = test_dir[0];
+  ray.ray.dir_y = test_dir[1];
+  ray.ray.dir_z = test_dir[2];
+  ray.ray.tnear = 0.f;
+  ray.ray.tfar = std::numeric_limits<float>::infinity();
+  ray.ray.mask = -1;
+  ray.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+  ray.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+  
+  auto scene = (RTCScene) fEmbreeScene_ptr;
+  RTCIntersectArguments iargs;  
+  rtcInitIntersectArguments(&iargs);
+  
+  iargs.filter = [](const RTCFilterFunctionNArguments* args) {
+     // extract intersection info
+     assert(args->N == 1);
+     const auto& h = args->hit;
+     const auto objID = RTCHitN_primID(h, 1, 0);
+     auto candidates = (std::vector<int>*)(args->geometryUserPtr);
+     if (candidates->size() == 0 || candidates->back() != objID) {
+       candidates->push_back(objID);
+     }
+     args->valid[0] = 0; // invalidate so that intersection continue (needed for parity test)
+  };
+
+  iargs.feature_mask = RTC_FEATURE_FLAG_ALL;
+  fIntersCandidates.clear();
+
+  // do the intersection
+  // Note: We could actually use the ray-Packet feature of Embree and perform a SIMD/parallel
+  // test using different directions for a "colloborative voting" on parity
+  rtcTraversableIntersect1(rtcGetSceneTraversable(scene), &ray, &iargs); 
+ 
+  int crossings = 0;
+  for (auto& primID : fIntersCandidates) {
+   const auto& facet = fFacets[primID];  
+   // do the final ray-triangle Intersection in double
+   const auto& v0 = fVertices[facet[0]];
+   const auto& v1 = fVertices[facet[1]];
+   const auto& v2 = fVertices[facet[2]];
+   const auto this_dist = rayTriangle(Vertex_t{point[0], point[1], point[2]}, 
+                                      test_dir, v0, v1, v2, 0.0);
+   if (this_dist != std::numeric_limits<double>::infinity()) {
+     ++crossings;
+   }
+  }
+  return crossings & 1;
+}
+
+double TGeoTessellated::Safety_Embree(const Double_t* point) const {
+  
+  struct ClosestPointContext {
+    float minDist2;
+    unsigned int primID;
+    RTCGeometry geom;
+  };
+
+  auto pointQueryFunc = [](RTCPointQueryFunctionArguments* args)
+  {
+    auto* ctx = static_cast<ClosestPointContext*>(args->userPtr);
+
+    // Access triangle vertices
+    const unsigned int primID = args->primID;
+
+    // Get geometry
+    RTCGeometry geom = ctx->geom;
+
+    const float* vertices =
+      (const float*)rtcGetGeometryBufferData(geom, RTC_BUFFER_TYPE_VERTEX, 0);
+    const unsigned int* indices =
+      (const unsigned int*)rtcGetGeometryBufferData(geom, RTC_BUFFER_TYPE_INDEX, 0);
+
+    const unsigned int i0 = indices[3 * primID + 0];
+    const unsigned int i1 = indices[3 * primID + 1];
+    const unsigned int i2 = indices[3 * primID + 2];
+
+    const float* v0 = vertices + 4 * i0; // 4 comes from sizeof Vertex
+    const float* v1 = vertices + 4 * i1;
+    const float* v2 = vertices + 4 * i2;
+
+    // Query point
+    const float px = args->query->x;
+    const float py = args->query->y;
+    const float pz = args->query->z;
+
+    // Compute closest point on triangle (standard algorithm)
+    float cp[3];
+    float dist2 = pointTriangleDistSq(Vec3f(px, py, pz), Vec3f{v0[0], v0[1], v0[2]}, Vec3f{v1[0], v1[1], v1[2]}, Vec3f{v2[0], v2[1], v2[2]});
+
+    if (dist2 < ctx->minDist2) {
+      ctx->minDist2 = dist2;
+      ctx->primID = primID;
+      // Update traversal radius (needed by Embree for BVH pruning)
+      args->query->radius = std::sqrt(dist2);
+    }
+    return true; // continue traversal
+  };
+
+  auto scene = (RTCScene) fEmbreeScene_ptr;
+  ClosestPointContext ctx;
+  ctx.minDist2 = std::numeric_limits<float>::infinity();
+  ctx.geom = rtcGetGeometry(scene, 0); //; ! to be filled with the geometry object
+
+  RTCPointQuery query;
+  query.x = point[0];
+  query.y = point[1];
+  query.z = point[2];
+  query.radius = std::numeric_limits<float>::infinity();
+  query.time = 0.0f;
+
+  RTCPointQueryContext qctx;
+  rtcInitPointQueryContext(&qctx);
+  
+  // this initiates the closest point query in Embree
+  rtcPointQuery(scene, &query, &qctx, pointQueryFunc, &ctx);
+
+  return std::sqrt(ctx.minDist2);
+}
+
+
+#endif

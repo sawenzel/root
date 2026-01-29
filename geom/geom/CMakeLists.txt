@@ -8,6 +8,28 @@
 # CMakeLists.txt file for building ROOT geom/geom package
 ############################################################################
 
+option(ENABLE_EMBREE "Enable Intel Embree" OFF)
+
+# we look for Intel Embree which can help with geometry navigation
+if(ENABLE_EMBREE)
+  find_package(Embree 4 QUIET)
+  if(Embree_FOUND)
+    message(STATUS "Geom: Embree support enabled")
+    set(GEOM_HAS_EMBREE TRUE)
+  else()
+    message(STATUS "Geom: Embree not found, disabling Embree support")
+  endif()
+endif()
+
+set(_geom_extra_deps)
+if(GEOM_HAS_EMBREE)
+  get_target_property(_embree_includes embree INTERFACE_INCLUDE_DIRECTORIES)
+  set_property(TARGET embree
+    PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_embree_includes}"
+  )
+  list(APPEND _geom_extra_deps embree)
+endif()
+
 ROOT_STANDARD_LIBRARY_PACKAGE(Geom
   HEADERS
     TGDMLMatrix.h
@@ -122,11 +144,16 @@ ROOT_STANDARD_LIBRARY_PACKAGE(Geom
     RIO
     MathCore
     Hist
-)
+  )
 
 # GCC has bugs with -O3 or -Ofast that break Geom
 if(CMAKE_COMPILER_IS_GNUCXX)
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 5 OR CMAKE_SIZEOF_VOID_P LESS 8)
     target_compile_options(Geom PRIVATE -O2)
   endif()
+endif()
+
+if(GEOM_HAS_EMBREE)
+  target_compile_definitions(Geom PRIVATE ROOT_GEOM_EMBREE)
+  target_link_libraries(Geom PRIVATE embree)
 endif()

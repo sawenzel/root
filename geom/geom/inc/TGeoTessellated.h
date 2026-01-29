@@ -17,6 +17,12 @@
 #include "TGeoTypedefs.h"
 #include "TGeoBBox.h"
 
+#define ROOT_GEOM_EMBREE
+#ifdef ROOT_GEOM_EMBREE
+#pragma message("EMBREE IS ENABLED")
+#endif
+
+
 class TGeoFacet {
    using Vertex_t = Tessellated::Vertex_t;
    using VertexVec_t = Tessellated::VertexVec_t;
@@ -73,6 +79,11 @@ private:
    std::multimap<long, int> fVerticesMap; //! Temporary map used to deduplicate vertices
    bool fIsClosed = false;                //! to know if shape still needs closure/initialization
    void *fBVH = nullptr;                  //! BVH acceleration structure for safety and navigation
+
+#ifdef ROOT_GEOM_EMBREE
+   void *fEmbreeScene_ptr = nullptr;      //!
+   mutable std::vector<int> fIntersCandidates;    //!
+#endif
 
    TGeoTessellated(const TGeoTessellated &) = delete;
    TGeoTessellated &operator=(const TGeoTessellated &) = delete;
@@ -151,6 +162,16 @@ public:
    Double_t DistFromInside_Loop(const Double_t *point, const Double_t *dir) const;
    Double_t DistFromOutside_Loop(const Double_t *point, const Double_t *dir) const;
    bool Contains_Loop(const Double_t *point) const;
+
+#ifdef ROOT_GEOM_EMBREE
+   Double_t DistFromInside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax = TGeoShape::Big()) const;
+   Double_t DistFromOutside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax = TGeoShape::Big()) const;
+   bool Contains_Embree(const Double_t *point) const;
+   Double_t Safety_Embree(const Double_t *point) const;
+   void BuildEmbreeGeometry();            //! initializes the Embree Geometry from this Tessellated 
+   bool fUseEmbree = false; //!
+#endif
+
 
    Double_t Capacity() const override;
 
