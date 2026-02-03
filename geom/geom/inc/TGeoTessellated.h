@@ -75,7 +75,11 @@ private:
    std::vector<Vertex_t> fVertices; // List of vertices
    std::vector<TGeoFacet> fFacets;  // List of facets
    std::vector<Vertex_t> fOutwardNormals; //! Vector of outward-facing normals
+   public:
+   std::vector<std::array<int,3>> fNeighbors;  //! lookup to get up to 3 edge-neighbours of each triangle ---> can be used to do topology checks but also for ray-tracing
+   std::vector<std::vector<int>> fVertexIdToFacets; // keeps track of all (vertex-sharing) neighbours of a facet
 
+private:
    std::multimap<long, int> fVerticesMap; //! Temporary map used to deduplicate vertices
    bool fIsClosed = false;                //! to know if shape still needs closure/initialization
    void *fBVH = nullptr;                  //! BVH acceleration structure for safety and navigation
@@ -83,6 +87,7 @@ private:
 #ifdef ROOT_GEOM_EMBREE
    void *fEmbreeScene_ptr = nullptr;      //!
    mutable std::vector<int> fIntersCandidates;    //!
+   mutable std::vector<std::pair<int, float>> fIntersCandidates_WithDistance;
 #endif
 
    TGeoTessellated(const TGeoTessellated &) = delete;
@@ -91,6 +96,8 @@ private:
    // bvh helper functions
    void BuildBVH();
    void CalculateNormals();
+public:
+   void InitNeighbours(); // initializes the neighbour relation
 
 public:
    // constructors
@@ -167,6 +174,7 @@ public:
    Double_t DistFromInside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax = TGeoShape::Big()) const;
    Double_t DistFromOutside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax = TGeoShape::Big()) const;
    bool Contains_Embree(const Double_t *point) const;
+   bool Contains_Embree_fast(const Double_t *point) const;
    Double_t Safety_Embree(const Double_t *point) const;
    void BuildEmbreeGeometry();            //! initializes the Embree Geometry from this Tessellated 
    bool fUseEmbree = false; //!

@@ -355,6 +355,7 @@ void TGeoTessellated::CloseShape(bool check, bool fixFlipped, bool verbose)
    BuildBVH();
    BuildEmbreeGeometry();
    CalculateNormals();
+   InitNeighbours();
    fIsClosed = true;
 }
 
@@ -794,6 +795,13 @@ inline T dot(const Vec3f<T> &a, const Vec3f<T> &b)
    return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
+// a variant of dot mixing Vertex_t and double*
+inline double dot(const Vertex_t& v, const double* dir)
+{
+   return v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2];
+}
+
+
 // Kernel to get closest/shortest distance between a point and a triangl (a,b,c).
 // Performed by default in float since Safety is approximation in any case.
 // Project point onto triangle plane
@@ -964,6 +972,7 @@ Double_t TGeoTessellated::DistFromOutside(const Double_t *point, const Double_t 
          auto thisdist = rayTriangle(Vertex_t(point[0], point[1], point[2]), Vertex_t(dir[0], dir[1], dir[2]),
                                      fVertices[facet[0]], fVertices[facet[1]], fVertices[facet[2]], 0.);
 
+         // std::cerr << "Probing triangle " << objectid << " " << thisdist;
          if (thisdist < local_step) {
             local_step = thisdist;
          }
@@ -975,7 +984,7 @@ Double_t TGeoTessellated::DistFromOutside(const Double_t *point, const Double_t 
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-/// DistFromOutside
+/// DistFromInside
 
 Double_t TGeoTessellated::DistFromInside(const Double_t *point, const Double_t *dir, Int_t iact, Double_t stepmax,
                                          Double_t *safe) const
@@ -1134,6 +1143,9 @@ bool TGeoTessellated::Contains(Double_t const *point) const
 {
 #ifdef ROOT_GEOM_EMBREE
    if (fUseEmbree) {
+     if (getenv("CONTAINS_FAST")) {
+       return Contains_Embree_fast(point);
+     }
      return Contains_Embree(point);
    }
 #endif
@@ -1195,8 +1207,10 @@ bool TGeoTessellated::Contains(Double_t const *point) const
                                       Vertex_t(test_dir[0], test_dir[1], test_dir[2]), v0, v1, v2, 0.);
 
          // std::cerr << " dist " << t << "\n";
+         // std::cerr << " checking " << objectid << "\n";
          if (t != std::numeric_limits<double>::infinity()) {
             ++crossings;
+            // std::cerr << " hit \n";
          }
       }
       return false;
@@ -1395,6 +1409,11 @@ inline Double_t TGeoTessellated::SafetyKernel(const Double_t *point, bool in, in
 
 Double_t TGeoTessellated::Safety(const Double_t *point, Bool_t in) const
 {
+#ifdef ROOT_GEOM_EMBREE
+   if (fUseEmbree) {
+      return Safety_Embree(point);
+   }
+#endif
    // we could use some caching here (in future) since queries to the solid will likely
    // be made with some locality
 
@@ -1558,6 +1577,86 @@ void TGeoTessellated::CalculateNormals()
    }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+/// Calculate the neighbour relationship
+  
+namespace {
+struct EdgeKey {
+    int a, b;
+    EdgeKey(int i, int j) {
+      a = std::min(i, j);
+      b = std::max(i, j);
+    }
+    bool operator<(const EdgeKey& o) const {
+     return a < o.a || (a == o.a && b < o.b);
+    }
+  }; // internal struct for hashing of edges
+}
+
+void TGeoTessellated::InitNeighbours()
+{
+  auto addNeighbor = [](std::array<int,3>& nbrs, int t) {
+    for (int i = 0; i < 3; ++i) {
+      if (nbrs[i] == -1) {
+        nbrs[i] = t;
+        return;
+      }
+    }
+    // more than 3 neighbors → non-manifold mesh
+  };
+
+  std::map<EdgeKey, int> edgeOwner; // edge → triangle index
+  fNeighbors.resize(fFacets.size(), { -1, -1, -1 });
+
+  for (int t = 0; t < (int)fFacets.size(); ++t) {
+    // loop over facets
+    const auto& tri = fFacets[t];
+
+    // loop over the edges made out if (i1, i2) index pairs
+    for (int e = 0; e < 3; ++e) {
+      int v0 = tri[e];
+      int v1 = tri[(e + 1) % 3];
+
+      EdgeKey key(v0, v1);
+
+      auto it = edgeOwner.find(key);
+      if (it == edgeOwner.end()) {
+        // first time we see this edge
+        edgeOwner[key] = t;
+      } else {
+        // second triangle sharing this edge → neighbors
+        int other = it->second;
+        addNeighbor(fNeighbors[t], other);
+        addNeighbor(fNeighbors[other], t);
+      }
+    }
+  }
+  // check topology
+  for (const auto& na : fNeighbors) {
+    for (const auto i : na) {
+      if (i==-1) {
+         // this means a missing neighbour triangle
+        std::cerr << "Neighbour problem";
+      }
+    }
+  }
+
+  // now init all vertex-sharing neighbours
+  // (step 1) go through all vertices and record triangle index
+  fVertexIdToFacets.resize(fVertices.size());
+  for (int facet_index = 0; facet_index < fFacets.size(); ++facet_index) {
+    const auto& facet = fFacets[facet_index]; 
+    for (int i = 0; i < 3; ++i) {
+       auto vertex_index = facet[i];
+       const auto& container = fVertexIdToFacets[vertex_index];
+       if (std::find(container.begin(), container.end(), facet_index) == container.end()) {
+           fVertexIdToFacets[vertex_index].push_back(facet_index);
+       }
+     }
+   }
+}
+
+
 
 #ifdef ROOT_GEOM_EMBREE
 
@@ -1571,8 +1670,20 @@ RTCDevice GetEmbreeDevice()
     if (!d) {
       throw std::runtime_error("Failed to create Embree device");
     }
+    auto ray4 = rtcGetDeviceProperty(d, RTC_DEVICE_PROPERTY_NATIVE_RAY4_SUPPORTED);
+    if (ray4) {
+      std::cout << "Embree supports Ray4 queries\n";
+    }
+    auto ray8 = rtcGetDeviceProperty(d, RTC_DEVICE_PROPERTY_NATIVE_RAY8_SUPPORTED);
+    if (ray8) {
+      std::cout << "Embree supports Ray8 queries\n";
+    }
+    else {
+      std::cout << "Embree does not support Ray8 queries\n";
+    }
     return d;
   }();
+
   return device;
 }
 
@@ -1605,10 +1716,10 @@ void TGeoTessellated::BuildEmbreeGeometry()
   rtcSetGeometryBuildQuality(geom, RTC_BUILD_QUALITY_HIGH);
   rtcSetGeometryTimeStepCount(geom, 1);
   meshID = rtcAttachGeometry(scene, geom);
-  std::cerr << "MeshID is " << meshID;
+  // std::cerr << "MeshID is " << meshID;
 
   struct Vertex {
-    float x, y, z, r; // 3D position + color (needed by Embree)
+    float x, y, z; // 3D position + color (needed by Embree)
   };
   struct Triangle {
     int v0, v1, v2;
@@ -1620,7 +1731,7 @@ void TGeoTessellated::BuildEmbreeGeometry()
 
   // allocate the triangle index and vertex buffers
   Vertex *vertices    = (Vertex *)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
-                                                          4 * sizeof(float), nvertices);
+                                                          3 * sizeof(float), nvertices);
   Triangle *triangles = (Triangle *)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
                                                             3 * sizeof(int), ntriangles);
 
@@ -1663,22 +1774,30 @@ void TGeoTessellated::BuildEmbreeGeometry()
   return; // geom;
 }
 
-Double_t TGeoTessellated::DistFromInside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax) const 
+// helper to init a ray, before queries to Embree
+template <typename T, typename W>
+inline
+void initEmbreeRay(T px, T py, T pz, T dx, T dy, T dz, W stepmax, RTCRayHit& ray) 
 {
-  RTCRayHit ray;
   memset(&ray, 0, sizeof(ray));
   ray.ray.flags = 0;
-  ray.ray.org_x = point[0];
-  ray.ray.org_y = point[1];
-  ray.ray.org_z = point[2];
-  ray.ray.dir_x = dir[0];
-  ray.ray.dir_y = dir[1];
-  ray.ray.dir_z = dir[2];
+  ray.ray.org_x = px;
+  ray.ray.org_y = py;
+  ray.ray.org_z = pz;
+  ray.ray.dir_x = dx;
+  ray.ray.dir_y = dy;
+  ray.ray.dir_z = dz;
   ray.ray.tnear = 0.f;
   ray.ray.tfar = std::numeric_limits<float>::infinity();
   ray.ray.mask = -1;
   ray.hit.geomID = RTC_INVALID_GEOMETRY_ID;
   ray.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+}
+
+Double_t TGeoTessellated::DistFromInside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax) const 
+{
+  RTCRayHit ray;
+  initEmbreeRay(point[0], point[1], point[2], dir[0], dir[1], dir[2], stepmax, ray);
   
   auto scene = (RTCScene) fEmbreeScene_ptr;
   RTCIntersectArguments iargs;  
@@ -1688,9 +1807,16 @@ Double_t TGeoTessellated::DistFromInside_Embree(const Double_t *point, const Dou
      // extract intersection info
      assert(args->N == 1);
      const auto& h = args->hit;
+     const auto& r = args->ray;
      const auto objID = RTCHitN_primID(h, 1, 0);
+     const auto tfar = RTCRayN_tfar(r, 1, 0);
      auto candidates = (std::vector<int>*)(args->geometryUserPtr);
      candidates->push_back(objID);
+     // std::cerr << "hitting " << objID << " at " << tfar;
+     if (tfar <= 0.) {
+       // check also the next intersection
+       args->valid[0] = 0;
+     }
   };
 
   iargs.feature_mask = RTC_FEATURE_FLAG_ALL;
@@ -1699,13 +1825,21 @@ Double_t TGeoTessellated::DistFromInside_Embree(const Double_t *point, const Dou
   
   // at this moment we have the (few) candidates and we need to check them 
   // in double precision
+  // we could advance a bit closer for higher precision
+
+  if (fIntersCandidates.size() == 0) {
+    // this shouldn't happen logically. Maybe watertight problems of Embree ---> dispatch to slower method
+    return this->TGeoTessellated::DistFromInside(point, dir, stepmax);
+  }
+
   double dist = Big();
+  bool hit_confirmed = false;
   for (auto& primID : fIntersCandidates) {
    const auto& facet = fFacets[primID];
    const auto& n = fOutwardNormals[primID];
    
    // do the quick right side of triangle check
-   if (n[0] * dir[0] + n[1] * dir[1] + n[2] * dir[2] <= 0.) {
+   if (dot(n, dir) <= 0.) {
      continue;
    }
    
@@ -1715,30 +1849,163 @@ Double_t TGeoTessellated::DistFromInside_Embree(const Double_t *point, const Dou
    const auto& v2 = fVertices[facet[2]];
    auto this_dist = rayTriangle(Vertex_t{point[0], point[1], point[2]}, 
                                 Vertex_t{dir[0], dir[1], dir[2]}, v0, v1, v2, 0.0);
+   
+   // std::cerr << " checking " << primID << " " << this_dist;
+
    if (this_dist < dist) {
      dist = this_dist;
+     hit_confirmed = true;
    }
   }
+
+  if (fIntersCandidates.size() > 0 && !hit_confirmed) {
+    // a more detailed treatment ... analysing also the neighbours (should be rarely done)
+    for (auto& primID : fIntersCandidates) {
+      const auto& facet = fFacets[primID];
+      for (int vertex_index = 0; vertex_index < 3; ++vertex_index) {    
+          for (const auto neighbourID : fVertexIdToFacets[facet[vertex_index]]) { 
+            if (neighbourID == primID) {
+              // this was already done before
+              continue;
+            }
+            const auto& n = fOutwardNormals[neighbourID];
+            // do the quick right side of triangle check
+            if (dot(n, dir) <= 0.) {
+              continue;
+            }
+            const auto& nFacet = fFacets[neighbourID];
+            // do the final ray-triangle Intersection in double
+            const auto& v0 = fVertices[nFacet[0]];
+            const auto& v1 = fVertices[nFacet[1]];
+            const auto& v2 = fVertices[nFacet[2]];
+            auto this_dist = rayTriangle(Vertex_t{point[0], point[1], point[2]}, 
+                                         Vertex_t{dir[0], dir[1], dir[2]}, v0, v1, v2, 0.0);
+   
+            // std::cerr << " neighbour checking " << neighbourID << " " << this_dist;
+
+            if (this_dist < dist) {
+              dist = this_dist;
+            }
+          }
+      }
+    }
+  }
+
   return dist;
 }
 
+// Double_t TGeoTessellated::DistFromOutside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax) const 
+// {
+//   Double_t cpoint[3] = {point[0], point[1], point[2]};
+//   int iter = 0;
+//   double offset = 0.;  
+//   // TGeoBBox::DistFromOutside(point)
+//   // we do a very quick approach to the solid (for now using TGeoBBox; should be inlined and taken from VecGeom)
+//   // can be done in float !
+//   if (!this->TGeoBBox::Contains(point)) {
+//     const auto dist_to_box = this->TGeoBBox::DistFromOutside(point, dir, stepmax);
+//     if (dist_to_box < Big()) {
+//       std::cerr << "approaching by " << dist_to_box;
+//       cpoint[0] = cpoint[0] + 0.999*dist_to_box*dir[0];
+//       cpoint[1] = cpoint[1] + 0.999*dist_to_box*dir[1];
+//       cpoint[2] = cpoint[2] + 0.999*dist_to_box*dir[2];      
+//       offset = 0.999*dist_to_box;
+//     }
+//   }
+
+//   auto scene = (RTCScene) fEmbreeScene_ptr;
+//   RTCIntersectArguments iargs;  
+//   rtcInitIntersectArguments(&iargs);
+  
+//   iargs.filter = [](const RTCFilterFunctionNArguments* args) {
+//      // extract intersection info
+//      assert(args->N == 1);
+//      const auto h = args->hit;
+//      const auto r = args->ray;
+//      const auto objID = RTCHitN_primID(h, 1, 0);
+//      const auto tfar = RTCRayN_tfar(r, 1, 0);
+//      auto candidates = (std::vector<int>*)(args->geometryUserPtr);
+//      std::cerr << "candidate " << objID << " " << tfar << "\n";
+//      candidates->push_back(objID);
+//   };
+  
+//   double final_dist = Big();
+//   while (true) {
+//     RTCRayHit ray;
+//     initEmbreeRay(cpoint[0], cpoint[1], cpoint[2], dir[0], dir[1], dir[2], stepmax, ray);
+  
+//     fIntersCandidates.clear();
+//     rtcTraversableIntersect1(rtcGetSceneTraversable(scene), &ray, &iargs); 
+      
+//     bool embree_found_intersection = fIntersCandidates.size() > 0;
+//     if (!embree_found_intersection) {
+//       return final_dist; // can't do anything
+//     }
+    
+//     bool intersect_confirmed = false;
+//     double iter_dist = Big();
+//     for (auto& primID : fIntersCandidates) {
+//       const auto& facet = fFacets[primID];
+//       const auto& n = fOutwardNormals[primID];
+   
+//       // do the quick right side of triangle check
+//       // if (n[0] * dir[0] + n[1] * dir[1] + n[2] * dir[2] > 0.) {
+//       //  continue;
+//       // }
+//       if (dot(n, dir) > 0.) {
+//          continue;
+//       }
+
+//       // do the final ray-triangle Intersection in double precision
+//       // we might have to be slightly more lax about the conditions
+//       const auto& v0 = fVertices[facet[0]];
+//       const auto& v1 = fVertices[facet[1]];
+//       const auto& v2 = fVertices[facet[2]];
+//       auto this_dist = rayTriangle(Vertex_t{cpoint[0], cpoint[1], cpoint[2]}, 
+//                                    Vertex_t{dir[0], dir[1], dir[2]}, v0, v1, v2, 0.0);
+   
+//       if (this_dist < iter_dist) {
+//         iter_dist = this_dist;
+//         intersect_confirmed = true;
+//       }
+//     } // end normal candidate check
+//     if (intersect_confirmed) {
+//       final_dist = (iter > 0)? final_dist + iter_dist : iter_dist;
+//       break;
+//     }
+//     else {
+//       if (iter == 2) {
+//          final_dist = final_dist + ray.ray.tfar;
+//          break;
+//       }
+
+//       // we take the approach to come closer to the surface and try again
+//       const double approach = 0.98 * ray.ray.tfar;
+//       cpoint[0] = cpoint[0] + dir[0] * approach;
+//       cpoint[1] = cpoint[1] + dir[1] * approach;
+//       cpoint[2] = cpoint[2] + dir[2] * approach;
+//       final_dist = (iter > 0)? final_dist + approach : approach;
+//       iter++;
+//     }
+//   } // end while
+//   return final_dist + offset;
+// }
+
 Double_t TGeoTessellated::DistFromOutside_Embree(const Double_t *point, const Double_t *dir, Double_t stepmax) const 
 {
-  RTCRayHit ray;
-  memset(&ray, 0, sizeof(ray));
-  ray.ray.flags = 0;
-  ray.ray.org_x = point[0];
-  ray.ray.org_y = point[1];
-  ray.ray.org_z = point[2];
-  ray.ray.dir_x = dir[0];
-  ray.ray.dir_y = dir[1];
-  ray.ray.dir_z = dir[2];
-  ray.ray.tnear = 0.f;
-  ray.ray.tfar = (stepmax < Big()) ? stepmax : std::numeric_limits<float>::infinity();
-  ray.ray.mask = -1;
-  ray.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-  ray.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-  
+  Double_t cpoint[3] = {point[0], point[1], point[2]};
+  double offset = 0.;  
+  if (!this->TGeoBBox::Contains(point)) {
+    const auto dist_to_box = this->TGeoBBox::DistFromOutside(point, dir, stepmax);
+    if (dist_to_box < Big()) {
+      // std::cerr << "approaching by " << dist_to_box;
+      cpoint[0] = cpoint[0] + 0.999*dist_to_box*dir[0];
+      cpoint[1] = cpoint[1] + 0.999*dist_to_box*dir[1];
+      cpoint[2] = cpoint[2] + 0.999*dist_to_box*dir[2];      
+      offset = 0.999*dist_to_box;
+    }
+  }
+
   auto scene = (RTCScene) fEmbreeScene_ptr;
   RTCIntersectArguments iargs;  
   rtcInitIntersectArguments(&iargs);
@@ -1746,40 +2013,87 @@ Double_t TGeoTessellated::DistFromOutside_Embree(const Double_t *point, const Do
   iargs.filter = [](const RTCFilterFunctionNArguments* args) {
      // extract intersection info
      assert(args->N == 1);
-     const auto& h = args->hit;
+     const auto h = args->hit;
+     const auto r = args->ray;
      const auto objID = RTCHitN_primID(h, 1, 0);
+     const auto tfar = RTCRayN_tfar(r, 1, 0);
      auto candidates = (std::vector<int>*)(args->geometryUserPtr);
+     // std::cerr << "candidate " << objID << " " << tfar << "\n";
      candidates->push_back(objID);
+     if (tfar <= 0.) {
+       // check also the next intersection
+       args->valid[0] = 0;
+     }
   };
-
-  iargs.feature_mask = RTC_FEATURE_FLAG_ALL;
+  
+  double final_dist = Big();
+  RTCRayHit ray;
+  initEmbreeRay(cpoint[0], cpoint[1], cpoint[2], dir[0], dir[1], dir[2], stepmax, ray);
+  
   fIntersCandidates.clear();
   rtcTraversableIntersect1(rtcGetSceneTraversable(scene), &ray, &iargs); 
-  
-  // at this moment we have the (few) candidates and we need to check them 
-  // in double precision
-  double dist = Big();
+      
+  bool embree_found_intersection = fIntersCandidates.size() > 0;
+  bool intersect_confirmed = false;
   for (auto& primID : fIntersCandidates) {
-   const auto& facet = fFacets[primID];
-   const auto& n = fOutwardNormals[primID];
+     const auto& facet = fFacets[primID];
+     const auto& n = fOutwardNormals[primID];
    
-   // do the quick right side of triangle check
-   if (n[0] * dir[0] + n[1] * dir[1] + n[2] * dir[2] > 0.) {
-     continue;
-   }
+     if (dot(n, dir) > 0.) {
+       continue;
+     }
+
+     // do the final ray-triangle Intersection in double precision
+     // we might have to be slightly more lax about the conditions
+     const auto& v0 = fVertices[facet[0]];
+     const auto& v1 = fVertices[facet[1]];
+     const auto& v2 = fVertices[facet[2]];
+     auto this_dist = rayTriangle(Vertex_t{cpoint[0], cpoint[1], cpoint[2]}, 
+                                  Vertex_t{dir[0], dir[1], dir[2]}, v0, v1, v2, 0.0);
    
-   // do the final ray-triangle Intersection in double precision
-   const auto& v0 = fVertices[facet[0]];
-   const auto& v1 = fVertices[facet[1]];
-   const auto& v2 = fVertices[facet[2]];
-   auto this_dist = rayTriangle(Vertex_t{point[0], point[1], point[2]}, 
-                                Vertex_t{dir[0], dir[1], dir[2]}, v0, v1, v2, 0.0);
-   if (this_dist < dist) {
-     dist = this_dist;
+     if (this_dist < final_dist) {
+        final_dist = this_dist;
+        intersect_confirmed = true;
+     }
+   } // end normal candidate check
+   
+   if (embree_found_intersection && !intersect_confirmed) {
+     // a more detailed treatment ... analysing also the neighbours (should be rarely done)
+     for (auto& primID : fIntersCandidates) {
+       const auto& facet = fFacets[primID];
+       for (int vertex_index = 0; vertex_index < 3; ++vertex_index) {    
+          for (const auto neighbourID : fVertexIdToFacets[facet[vertex_index]]) { 
+            if (neighbourID == primID) {
+              // this was already done before
+              continue;
+            }
+            const auto& n = fOutwardNormals[neighbourID];
+            // do the quick right side of triangle check
+            if (dot(n, dir) > 0.) {
+              continue;
+            }
+            const auto& nFacet = fFacets[neighbourID];
+            // do the final ray-triangle Intersection in double
+            const auto& v0 = fVertices[nFacet[0]];
+            const auto& v1 = fVertices[nFacet[1]];
+            const auto& v2 = fVertices[nFacet[2]];
+            auto this_dist = rayTriangle(Vertex_t{cpoint[0], cpoint[1], cpoint[2]}, 
+                                         Vertex_t{dir[0], dir[1], dir[2]}, v0, v1, v2, 0.0);
+   
+            // std::cerr << " neighbour checking " << neighbourID << " " << this_dist;
+
+            if (this_dist < final_dist) {
+              final_dist = this_dist;
+            }
+          }
+       }
+     }
    }
-  }
-  return dist;
+   return final_dist + offset;
 }
+
+
+
 
 bool TGeoTessellated::Contains_Embree(const Double_t *point) const 
 {
@@ -1789,19 +2103,7 @@ bool TGeoTessellated::Contains_Embree(const Double_t *point) const
   Vertex_t test_dir{1.0, 1.41421356237, 1.73205080757};
 
   RTCRayHit ray;
-  memset(&ray, 0, sizeof(ray));
-  ray.ray.flags = 0;
-  ray.ray.org_x = point[0];
-  ray.ray.org_y = point[1];
-  ray.ray.org_z = point[2];
-  ray.ray.dir_x = test_dir[0];
-  ray.ray.dir_y = test_dir[1];
-  ray.ray.dir_z = test_dir[2];
-  ray.ray.tnear = 0.f;
-  ray.ray.tfar = std::numeric_limits<float>::infinity();
-  ray.ray.mask = -1;
-  ray.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-  ray.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+  initEmbreeRay(point[0], point[1], point[2], test_dir[0], test_dir[1], test_dir[2], std::numeric_limits<float>::infinity(), ray);
   
   auto scene = (RTCScene) fEmbreeScene_ptr;
   RTCIntersectArguments iargs;  
@@ -1813,6 +2115,7 @@ bool TGeoTessellated::Contains_Embree(const Double_t *point) const
      const auto& h = args->hit;
      const auto objID = RTCHitN_primID(h, 1, 0);
      auto candidates = (std::vector<int>*)(args->geometryUserPtr);
+     // std::cerr << "seeing candidate " << objID;
      if (candidates->size() == 0 || candidates->back() != objID) {
        candidates->push_back(objID);
      }
@@ -1824,7 +2127,7 @@ bool TGeoTessellated::Contains_Embree(const Double_t *point) const
 
   // do the intersection
   // Note: We could actually use the ray-Packet feature of Embree and perform a SIMD/parallel
-  // test using different directions for a "colloborative voting" on parity
+  // test using different directions for a "collaborative voting" on parity
   rtcTraversableIntersect1(rtcGetSceneTraversable(scene), &ray, &iargs); 
  
   int crossings = 0;
@@ -1836,15 +2139,82 @@ bool TGeoTessellated::Contains_Embree(const Double_t *point) const
    const auto& v2 = fVertices[facet[2]];
    const auto this_dist = rayTriangle(Vertex_t{point[0], point[1], point[2]}, 
                                       test_dir, v0, v1, v2, 0.0);
+   
+   // std::cerr << " checking " << primID << "\n";
    if (this_dist != std::numeric_limits<double>::infinity()) {
      ++crossings;
+     // std::cerr << " hit \n";
    }
   }
   return crossings & 1;
 }
 
-double TGeoTessellated::Safety_Embree(const Double_t* point) const {
+bool TGeoTessellated::Contains_Embree_fast(const Double_t *point) const 
+{
+  if (!TGeoBBox::Contains(point)) {
+    return false;
+  }
+  Vertex_t test_dir{1.0, 1.41421356237, 1.73205080757};
+
+  RTCRayHit ray;
+  initEmbreeRay(point[0], point[1], point[2], test_dir[0], test_dir[1], test_dir[2], std::numeric_limits<float>::infinity(), ray);
   
+  auto scene = (RTCScene) fEmbreeScene_ptr;
+  RTCIntersectArguments iargs;  
+  rtcInitIntersectArguments(&iargs);
+  
+  iargs.filter = [](const RTCFilterFunctionNArguments* args) {
+     // extract intersection info
+     assert(args->N == 1);
+     const auto& h = args->hit;
+     const auto& r = args->ray;
+     const auto objID = RTCHitN_primID(h, 1, 0);
+     const auto tfar = RTCRayN_tfar(r, 1, 0);
+     auto candidates = (std::vector<std::pair<int, float>>*)(args->geometryUserPtr);
+     // std::cerr << "seeing candidate " << objID;
+     if (candidates->size() == 0 || candidates->back().first != objID) {
+       candidates->push_back({objID, tfar});
+     }
+     args->valid[0] = 0; // invalidate so that intersection continue (needed for parity test)
+  };
+
+  iargs.feature_mask = RTC_FEATURE_FLAG_ALL;
+  fIntersCandidates_WithDistance.clear();
+
+  auto geom = rtcGetGeometry(scene, 0);
+  rtcSetGeometryUserData(geom, (void*)&fIntersCandidates_WithDistance);
+
+  // do the intersection
+  // Note: We could actually use the ray-Packet feature of Embree and perform a SIMD/parallel
+  // test using different directions for a "collaborative voting" on parity
+  rtcTraversableIntersect1(rtcGetSceneTraversable(scene), &ray, &iargs); 
+ 
+  auto deduplicate_by_distance = [](
+    std::vector<std::pair<int, float>>& v,
+    float eps = 1e-6f)
+  {
+    auto it = std::unique(v.begin(), v.end(),
+                          [eps](const auto& a, const auto& b) {
+                              return std::fabs(a.second - b.second) <= eps;
+                          });
+
+    v.erase(it, v.end());
+  };
+  
+  deduplicate_by_distance(fIntersCandidates_WithDistance);
+
+  int crossings = fIntersCandidates_WithDistance.size();
+  //for (auto hits : fIntersCandidates_WithDistance) {
+    // we deduplicate the distances and count the remaining intersections;
+  //}
+  
+  // set back the user data
+  rtcSetGeometryUserData(geom, (void*)&fIntersCandidates);
+  return crossings & 1;
+}
+
+
+double TGeoTessellated::Safety_Embree(const Double_t* point) const {
   struct ClosestPointContext {
     float minDist2;
     unsigned int primID;
@@ -1854,13 +2224,10 @@ double TGeoTessellated::Safety_Embree(const Double_t* point) const {
   auto pointQueryFunc = [](RTCPointQueryFunctionArguments* args)
   {
     auto* ctx = static_cast<ClosestPointContext*>(args->userPtr);
-
     // Access triangle vertices
     const unsigned int primID = args->primID;
-
     // Get geometry
     RTCGeometry geom = ctx->geom;
-
     const float* vertices =
       (const float*)rtcGetGeometryBufferData(geom, RTC_BUFFER_TYPE_VERTEX, 0);
     const unsigned int* indices =
@@ -1869,10 +2236,9 @@ double TGeoTessellated::Safety_Embree(const Double_t* point) const {
     const unsigned int i0 = indices[3 * primID + 0];
     const unsigned int i1 = indices[3 * primID + 1];
     const unsigned int i2 = indices[3 * primID + 2];
-
-    const float* v0 = vertices + 4 * i0; // 4 comes from sizeof Vertex
-    const float* v1 = vertices + 4 * i1;
-    const float* v2 = vertices + 4 * i2;
+    const float* v0 = vertices + 3 * i0; // 3 comes from sizeof Vertex
+    const float* v1 = vertices + 3 * i1;
+    const float* v2 = vertices + 3 * i2;
 
     // Query point
     const float px = args->query->x;
@@ -1880,8 +2246,10 @@ double TGeoTessellated::Safety_Embree(const Double_t* point) const {
     const float pz = args->query->z;
 
     // Compute closest point on triangle (standard algorithm)
-    float cp[3];
-    float dist2 = pointTriangleDistSq(Vec3f(px, py, pz), Vec3f{v0[0], v0[1], v0[2]}, Vec3f{v1[0], v1[1], v1[2]}, Vec3f{v2[0], v2[1], v2[2]});
+    float dist2 = pointTriangleDistSq(Vec3f{px, py, pz}, 
+                                      Vec3f{v0[0], v0[1], v0[2]}, 
+                                      Vec3f{v1[0], v1[1], v1[2]}, 
+                                      Vec3f{v2[0], v2[1], v2[2]});
 
     if (dist2 < ctx->minDist2) {
       ctx->minDist2 = dist2;
@@ -1901,7 +2269,8 @@ double TGeoTessellated::Safety_Embree(const Double_t* point) const {
   query.x = point[0];
   query.y = point[1];
   query.z = point[2];
-  query.radius = std::numeric_limits<float>::infinity();
+  // this could be replaced by safety to bounding box for faster culling
+  query.radius =std::numeric_limits<float>::infinity();
   query.time = 0.0f;
 
   RTCPointQueryContext qctx;
@@ -1910,7 +2279,7 @@ double TGeoTessellated::Safety_Embree(const Double_t* point) const {
   // this initiates the closest point query in Embree
   rtcPointQuery(scene, &query, &qctx, pointQueryFunc, &ctx);
 
-  return std::sqrt(ctx.minDist2);
+  return std::nextafter(std::sqrt(ctx.minDist2),0.f);
 }
 
 
