@@ -1788,7 +1788,8 @@ void initEmbreeRay(T px, T py, T pz, T dx, T dy, T dz, W stepmax, RTCRayHit& ray
   ray.ray.dir_y = dy;
   ray.ray.dir_z = dz;
   ray.ray.tnear = 0.f;
-  ray.ray.tfar = std::numeric_limits<float>::infinity();
+
+  ray.ray.tfar = stepmax; // std::numeric_limits<float>::infinity();
   ray.ray.mask = -1;
   ray.hit.geomID = RTC_INVALID_GEOMETRY_ID;
   ray.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
@@ -1817,6 +1818,9 @@ Double_t TGeoTessellated::DistFromInside_Embree(const Double_t *point, const Dou
        // check also the next intersection
        args->valid[0] = 0;
      }
+     
+     // update tfar for better pruning??
+     // RTCRayN_tfar(r, 1, 0) = better_t;  // smaller only
   };
 
   iargs.feature_mask = RTC_FEATURE_FLAG_ALL;
@@ -2024,7 +2028,10 @@ Double_t TGeoTessellated::DistFromOutside_Embree(const Double_t *point, const Do
        // check also the next intersection
        args->valid[0] = 0;
      }
-  };
+     // TODO: We should check immediately if candidate hits
+     // and try to set ray->tfar
+  
+   };
   
   double final_dist = Big();
   RTCRayHit ray;
