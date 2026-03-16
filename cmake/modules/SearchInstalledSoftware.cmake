@@ -867,6 +867,8 @@ if (daos)
     endif()
   endif()
 endif()
+set(daos OFF CACHE BOOL "Disabled (libuuid not found)" FORCE)
+set(daos_mock OFF CACHE BOOL "Disabled (libuuid not found)" FORCE)
 
 #---Check for TBB---------------------------------------------------------------------
 if(imt AND NOT builtin_tbb)
