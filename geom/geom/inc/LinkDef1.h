@@ -78,6 +78,9 @@
 #pragma link C++ class ROOT::Geom::Vertex_t + ;
 #pragma link C++ class TGeoFacet + ;
 #pragma link C++ class TGeoTessellated - ;
+#ifdef R__HAS_EMBREE
+#pragma link C++ class TGeoTessellatedEmbree - ;
+#endif
 #pragma link C++ class TGeoShapeAssembly + ;
 #pragma link C++ class TGeoScaledShape + ;
 #pragma link C++ class TGeoVolume - ;

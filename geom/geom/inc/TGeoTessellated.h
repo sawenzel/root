@@ -80,6 +80,13 @@ private:
    void BuildBVH();
    void CalculateNormals();
 
+protected:
+   // Read-only accessors to the mesh data, used by derived navigation backends
+   // such as TGeoTessellatedEmbree.
+   const std::vector<Vertex_t> &GetVertices() const { return fVertices; }
+   const std::vector<TGeoFacet> &GetFacets() const { return fFacets; }
+   const std::vector<Vertex_t> &GetOutwardNormals() const { return fOutwardNormals; }
+
 public:
    // constructors
    TGeoTessellated() {}
@@ -89,7 +96,7 @@ public:
    ~TGeoTessellated() override {}
 
    void ComputeBBox() override;
-   void CloseShape(bool check = true, bool fixFlipped = true, bool verbose = true);
+   virtual void CloseShape(bool check = true, bool fixFlipped = true, bool verbose = true);
 
    bool AddFacet(const Vertex_t &pt0, const Vertex_t &pt1, const Vertex_t &pt2);
    bool AddFacet(const Vertex_t &pt0, const Vertex_t &pt1, const Vertex_t &pt2, const Vertex_t &pt3);

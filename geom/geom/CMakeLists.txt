@@ -8,6 +8,19 @@
 # CMakeLists.txt file for building ROOT geom/geom package
 ############################################################################
 
+# Optional Intel Embree support, used by TGeoTessellatedEmbree to accelerate the
+# navigation of tessellated solids.
+option(ENABLE_EMBREE "Enable Intel Embree based navigation for tessellated solids" OFF)
+if(ENABLE_EMBREE)
+  find_package(Embree 4 QUIET)
+  if(Embree_FOUND)
+    message(STATUS "Geom: Intel Embree support enabled")
+    set(GEOM_HAS_EMBREE TRUE)
+  else()
+    message(STATUS "Geom: Intel Embree not found, disabling Embree support")
+  endif()
+endif()
+
 ROOT_STANDARD_LIBRARY_PACKAGE(Geom
   HEADERS
     TGDMLMatrix.h
@@ -61,6 +74,7 @@ ROOT_STANDARD_LIBRARY_PACKAGE(Geom
     TGeoVoxelFinder.h
     TGeoXtru.h
     TGeoTessellated.h
+    TGeoTessellatedEmbree.h
     TGeoVector3.h
     TVirtualGeoConverter.h
     TVirtualGeoChecker.h
@@ -115,6 +129,7 @@ ROOT_STANDARD_LIBRARY_PACKAGE(Geom
     src/TGeoVoxelFinder.cxx
     src/TGeoXtru.cxx
     src/TGeoTessellated.cxx
+    src/TGeoTessellatedEmbree.cxx
     src/TGeoVector3.cxx
     src/TVirtualGeoConverter.cxx
     src/TVirtualGeoChecker.cxx
@@ -135,4 +150,14 @@ if(CMAKE_COMPILER_IS_GNUCXX)
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 5 OR CMAKE_SIZEOF_VOID_P LESS 8)
     target_compile_options(Geom PRIVATE -O2)
   endif()
+endif()
+
+if(GEOM_HAS_EMBREE)
+  # Treat the Embree headers as system headers to avoid spurious warnings.
+  get_target_property(_embree_includes embree INTERFACE_INCLUDE_DIRECTORIES)
+  set_property(TARGET embree PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_embree_includes}")
+  # R__HAS_EMBREE is added to the Geom target; it is forwarded to rootcling via
+  # the target COMPILE_DEFINITIONS, so the dictionary picks up the new class too.
+  target_compile_definitions(Geom PRIVATE R__HAS_EMBREE)
+  target_link_libraries(Geom PRIVATE embree)
 endif()
