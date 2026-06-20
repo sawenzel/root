@@ -75,6 +75,7 @@ ROOT_STANDARD_LIBRARY_PACKAGE(Geom
     TGeoXtru.h
     TGeoTessellated.h
     TGeoTessellatedEmbree.h
+    TGeoTessellatedEmbreeUser.h
     TGeoVector3.h
     TVirtualGeoConverter.h
     TVirtualGeoChecker.h
@@ -130,6 +131,7 @@ ROOT_STANDARD_LIBRARY_PACKAGE(Geom
     src/TGeoXtru.cxx
     src/TGeoTessellated.cxx
     src/TGeoTessellatedEmbree.cxx
+    src/TGeoTessellatedEmbreeUser.cxx
     src/TGeoVector3.cxx
     src/TVirtualGeoConverter.cxx
     src/TVirtualGeoChecker.cxx

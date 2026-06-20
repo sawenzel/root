@@ -80,6 +80,7 @@
 #pragma link C++ class TGeoTessellated - ;
 #ifdef R__HAS_EMBREE
 #pragma link C++ class TGeoTessellatedEmbree - ;
+#pragma link C++ class TGeoTessellatedEmbreeUser - ;
 #endif
 #pragma link C++ class TGeoShapeAssembly + ;
 #pragma link C++ class TGeoScaledShape + ;
