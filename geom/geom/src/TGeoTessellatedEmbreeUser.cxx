@@ -40,8 +40,10 @@ triangle based backend.
 #include <embree4/rtcore.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -49,6 +51,24 @@ triangle based backend.
 ClassImp(TGeoTessellatedEmbreeUser);
 
 namespace {
+
+// Benchmark counters: total number of per-facet intersection tests performed in
+// the user callbacks, aggregated across all queries. A cheap local int is
+// accumulated per query (in the query context) and added once per call, so the
+// hot loop is not slowed down by atomics. The totals are printed at program exit.
+std::atomic<unsigned long long> gContainsFacetIntersections{0};
+std::atomic<unsigned long long> gDistFromInsideFacetIntersections{0};
+std::atomic<unsigned long long> gDistFromOutsideFacetIntersections{0};
+
+struct FacetIntersectionStatsDumper {
+   ~FacetIntersectionStatsDumper()
+   {
+      std::cerr << "[TGeoTessellatedEmbreeUser] total facet intersections:"
+                << " Contains=" << gContainsFacetIntersections.load()
+                << " DistFromOutside=" << gDistFromOutsideFacetIntersections.load()
+                << " DistFromInside=" << gDistFromInsideFacetIntersections.load() << std::endl;
+   }
+} gFacetIntersectionStatsDumper;
 
 // Singleton Embree device shared within the process.
 RTCDevice GetEmbreeDevice()
@@ -75,12 +95,17 @@ struct EmbreeMesh {
 // single context type is shared by the distance and the Contains queries so a
 // single intersect callback can be registered on the geometry.
 struct EmbreeQueryContext : public RTCRayQueryContext {
-   enum Mode { kInside, kOutside, kContains } mode;
-   Vertex_t org;    // ray origin (double)
-   Vertex_t dir;    // ray direction (double)
-   double bestT;    // nearest accepted distance (distance queries)
-   int bestFacet;   // facet of the nearest accepted hit, -1 if none
-   int crossings;   // number of surface crossings (Contains query)
+   enum Mode {
+      kInside,
+      kOutside,
+      kContains
+   } mode;
+   Vertex_t org;          // ray origin (double)
+   Vertex_t dir;          // ray direction (double)
+   double bestT;          // nearest accepted distance (distance queries)
+   int bestFacet;         // facet of the nearest accepted hit, -1 if none
+   int crossings;         // number of surface crossings (Contains query)
+   int intersectionCount; // facets handed to the intersect callback (benchmark counter)
 };
 
 // Round a double bound to a single precision value that is guaranteed to lie
@@ -135,6 +160,9 @@ void intersectFunc(const RTCIntersectFunctionNArguments *args)
    const unsigned int primID = args->primID;
    const auto &facet = (*mesh->facets)[primID];
    const auto &vertices = *mesh->vertices;
+
+   // benchmark counter: every facet the BVH traversal hands to this callback
+   ++ctx->intersectionCount;
 
    if (ctx->mode == EmbreeQueryContext::kContains) {
       // Parity test: count every facet actually crossed (quads handled inside
@@ -257,8 +285,8 @@ void TGeoTessellatedEmbreeUser::BuildEmbreeGeometry()
 
 namespace {
 
-double distQuery(RTCScene scene, EmbreeQueryContext::Mode mode, const Vertex_t &org, const Vertex_t &dir,
-                 double stepmax)
+double
+distQuery(RTCScene scene, EmbreeQueryContext::Mode mode, const Vertex_t &org, const Vertex_t &dir, double stepmax)
 {
    EmbreeQueryContext ctx;
    rtcInitRayQueryContext(&ctx);
@@ -268,6 +296,7 @@ double distQuery(RTCScene scene, EmbreeQueryContext::Mode mode, const Vertex_t &
    ctx.bestT = TGeoShape::Big();
    ctx.bestFacet = -1;
    ctx.crossings = 0;
+   ctx.intersectionCount = 0;
 
    RTCRayHit ray;
    std::memset(&ray, 0, sizeof(ray));
@@ -287,6 +316,10 @@ double distQuery(RTCScene scene, EmbreeQueryContext::Mode mode, const Vertex_t &
    rtcInitIntersectArguments(&iargs);
    iargs.context = &ctx;
    rtcIntersect1(scene, &ray, &iargs);
+
+   auto &counter =
+      (mode == EmbreeQueryContext::kInside) ? gDistFromInsideFacetIntersections : gDistFromOutsideFacetIntersections;
+   counter.fetch_add(ctx.intersectionCount, std::memory_order_relaxed);
 
    return (ctx.bestFacet >= 0) ? ctx.bestT : TGeoShape::Big();
 }
@@ -363,6 +396,7 @@ bool TGeoTessellatedEmbreeUser::Contains(const Double_t *point) const
    ctx.bestT = TGeoShape::Big();
    ctx.bestFacet = -1;
    ctx.crossings = 0;
+   ctx.intersectionCount = 0;
 
    RTCRayHit ray;
    std::memset(&ray, 0, sizeof(ray));
@@ -383,6 +417,8 @@ bool TGeoTessellatedEmbreeUser::Contains(const Double_t *point) const
    iargs.context = &ctx;
    rtcIntersect1((RTCScene)fEmbreeScene, &ray, &iargs);
 
+   gContainsFacetIntersections.fetch_add(ctx.intersectionCount, std::memory_order_relaxed);
+
    return ctx.crossings & 1;
 }
 
@@ -391,6 +427,29 @@ bool TGeoTessellatedEmbreeUser::Contains(const Double_t *point) const
 
 Double_t TGeoTessellatedEmbreeUser::Safety(const Double_t *point, Bool_t /*in*/) const
 {
+   // (a) "Stop short" for points outside the bounding box: return the safety to
+   // the outer box, a conservative underestimate of the true safety (the closest
+   // facet can never be nearer than the box). This mirrors the top-node early-out
+   // of the base TGeoTessellated::SafetyKernel and avoids descending the BVH for
+   // points that are anyway far from the surface. The Euclidean distance to the
+   // box is used so the estimate matches the base kernel exactly.
+   //
+   // TODO(b): the base SafetyKernel can additionally stop at *intermediate* BVH
+   // nodes (returning a coarse bbox underestimate when a subtree is farther than a
+   // threshold). That node-level early-stop cannot be expressed through Embree's
+   // rtcPointQuery, which only calls back at the leaf/primitive level. To gain it
+   // here, Safety would have to be routed through an estimating base SafetyKernel
+   // instead of the Embree closest-point query (see analysis).
+   if (!TGeoBBox::Contains(point)) {
+      double d2 = 0.;
+      const double dd[3] = {std::fabs(point[0] - fOrigin[0]) - fDX, std::fabs(point[1] - fOrigin[1]) - fDY,
+                            std::fabs(point[2] - fOrigin[2]) - fDZ};
+      for (double q : dd)
+         if (q > 0.)
+            d2 += q * q;
+      return std::sqrt(d2);
+   }
+
    struct SafetyContext {
       const EmbreeMesh *mesh;
       Vec3f<double> p;

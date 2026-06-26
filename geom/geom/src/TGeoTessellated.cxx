@@ -40,12 +40,47 @@ for the composing faces.
 // some kernels on top of BVH
 #include <bvh2_extra_kernels.h>
 
+#include <atomic>
 #include <cmath>
+#include <iostream>
 #include <limits>
 
 ClassImp(TGeoTessellated);
 
 using Vertex_t = Tessellated::Vertex_t;
+
+namespace {
+// Benchmark counters: total number of per-facet intersection tests performed by
+// the BVH navigation, aggregated across all queries. A cheap thread-local int is
+// accumulated inside each query and added here once per call, so the hot loop is
+// not slowed down by atomics. The totals are printed at program exit.
+std::atomic<unsigned long long> gContainsFacetIntersections{0};
+std::atomic<unsigned long long> gDistFromInsideFacetIntersections{0};
+std::atomic<unsigned long long> gDistFromOutsideFacetIntersections{0};
+std::atomic<unsigned long long> gLeafContains{0};
+std::atomic<unsigned long long> gLeafDistFromIN{0};
+std::atomic<unsigned long long> gLeafDistFromOUT{0};
+std::atomic<unsigned long long> gInnerContains{0};
+std::atomic<unsigned long long> gInnerDistFromIN{0};
+std::atomic<unsigned long long> gInnerDistFromOUT{0};
+
+struct FacetIntersectionStatsDumper {
+   ~FacetIntersectionStatsDumper()
+   {
+      std::cerr << "[TGeoTessellated] total facet intersections:"
+                << " Contains=" << gContainsFacetIntersections.load()
+                << " DistFromOutside=" << gDistFromOutsideFacetIntersections.load()
+                << " DistFromInside=" << gDistFromInsideFacetIntersections.load() << std::endl;
+
+      std::cerr << "[TGeotesselated] total leaf intersection:"
+                << " contains: " << gLeafContains.load() << " DistFromOut: " << gLeafDistFromOUT.load()
+                << " DistFromIN: " << gLeafDistFromIN.load() << std::endl;
+      std::cerr << "[TGeoTesselated] inner intersects:"
+                << " contains: " << gInnerContains.load() << " DistFromOut: " << gInnerDistFromOUT.load()
+                << " DistFromInside: " << gInnerDistFromIN.load() << std::endl;
+   }
+} gFacetIntersectionStatsDumper;
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////
 /// Compact consecutive equal vertices
@@ -747,7 +782,9 @@ Double_t TGeoTessellated::DistFromOutside(const Double_t *point, const Double_t 
 {
    // use the BVH intersector in combination with leaf ray-triangle testing
    double local_step = Big(); // we need this otherwise the lambda get's confused
-
+   int intersection_counter = 0;
+   int leaf_counter = 0;
+   int innerCtr = 0;
    using Scalar = float;
    using Vec3 = bvh::v2::Vec<Scalar, 3>;
    using Node = bvh::v2::Node<Scalar, 3>;
@@ -799,26 +836,34 @@ Double_t TGeoTessellated::DistFromOutside(const Double_t *point, const Double_t 
    Vertex_t dir_v{dir[0], dir[1], dir[2]};
    // Traverse the BVH and apply concrete object intersection in BVH leafs
    bvh::v2::GrowingStack<Bvh::Index> stack;
-   mybvh->intersect<false, use_robust_traversal>(ray, mybvh->get_root().index, stack, [&](size_t begin, size_t end) {
-      for (size_t prim_id = begin; prim_id < end; ++prim_id) {
-         auto objectid = mybvh->prim_ids[prim_id];
-         const auto &facet = fFacets[objectid];
-         const auto &n = fOutwardNormals[objectid];
+   mybvh->intersect<false, use_robust_traversal>(
+      ray, mybvh->get_root().index, stack,
+      [&](size_t begin, size_t end) {
+         leaf_counter += 1;
+         for (size_t prim_id = begin; prim_id < end; ++prim_id) {
+            intersection_counter += 1;
+            auto objectid = mybvh->prim_ids[prim_id];
+            const auto &facet = fFacets[objectid];
+            const auto &n = fOutwardNormals[objectid];
 
-         // quick normal test. Coming from outside, the dot product must be negative
-         if (n.Dot(dir_v) > 0.) {
-            continue;
+            // quick normal test. Coming from outside, the dot product must be negative
+            if (n.Dot(dir_v) > 0.) {
+               continue;
+            }
+
+            auto thisdist = rayFacet(Vertex_t(point[0], point[1], point[2]), dir_v, facet, fVertices, 0.);
+
+            if (thisdist < local_step) {
+               local_step = thisdist;
+               ray.tmax = truncate_roundup(local_step);
+            }
          }
-
-         auto thisdist = rayFacet(Vertex_t(point[0], point[1], point[2]), dir_v, facet, fVertices, 0.);
-
-         if (thisdist < local_step) {
-            local_step = thisdist;
-         }
-      }
-      return false; // go on after this
-   });
-
+         return false; // go on after this
+      },
+      [&innerCtr](const Node &, const Node &) { innerCtr += 1; });
+   gDistFromOutsideFacetIntersections.fetch_add(intersection_counter, std::memory_order_relaxed);
+   gLeafDistFromOUT.fetch_add(leaf_counter, std::memory_order_relaxed);
+   gInnerDistFromOUT.fetch_add(innerCtr, std::memory_order_relaxed);
    return local_step;
 }
 
@@ -830,7 +875,9 @@ Double_t TGeoTessellated::DistFromInside(const Double_t *point, const Double_t *
 {
    // use the BVH intersector in combination with leaf ray-triangle testing
    double local_step = Big(); // we need this otherwise the lambda get's confused
-
+   int intersection_counter = 0;
+   int leaf_calls = 0;
+   int innerCtr = 0;
    using Scalar = float;
    using Vec3 = bvh::v2::Vec<Scalar, 3>;
    using Node = bvh::v2::Node<Scalar, 3>;
@@ -861,25 +908,33 @@ Double_t TGeoTessellated::DistFromInside(const Double_t *point, const Double_t *
    Vertex_t dir_v{dir[0], dir[1], dir[2]};
    // Traverse the BVH and apply concrete object intersection in BVH leafs
    bvh::v2::GrowingStack<Bvh::Index> stack;
-   mybvh->intersect<false, use_robust_traversal>(ray, mybvh->get_root().index, stack, [&](size_t begin, size_t end) {
-      for (size_t prim_id = begin; prim_id < end; ++prim_id) {
-         auto objectid = mybvh->prim_ids[prim_id];
-         auto facet = fFacets[objectid];
-         const auto &n = fOutwardNormals[objectid];
+   mybvh->intersect<false, use_robust_traversal>(
+      ray, mybvh->get_root().index, stack,
+      [&](size_t begin, size_t end) {
+         leaf_calls += 1;
+         for (size_t prim_id = begin; prim_id < end; ++prim_id) {
+            intersection_counter += 1;
+            auto objectid = mybvh->prim_ids[prim_id];
+            auto facet = fFacets[objectid];
+            const auto &n = fOutwardNormals[objectid];
 
-         // Only exiting surfaces are relevant (from inside--> dot product must be positive)
-         if (n.Dot(dir_v) <= 0.) {
-            continue;
+            // Only exiting surfaces are relevant (from inside--> dot product must be positive)
+            if (n.Dot(dir_v) <= 0.) {
+               continue;
+            }
+
+            const double t = rayFacet(Vertex_t{point[0], point[1], point[2]}, dir_v, facet, fVertices, 0.);
+            if (t < local_step) {
+               local_step = t;
+               ray.tmax = truncate_roundup(local_step);
+            }
          }
-
-         const double t = rayFacet(Vertex_t{point[0], point[1], point[2]}, dir_v, facet, fVertices, 0.);
-         if (t < local_step) {
-            local_step = t;
-         }
-      }
-      return false; // go on after this
-   });
-
+         return false; // go on after this
+      },
+      [&innerCtr](const Node &, const Node &) { innerCtr += 1; });
+   gDistFromInsideFacetIntersections.fetch_add(intersection_counter, std::memory_order_relaxed);
+   gLeafDistFromIN.fetch_add(leaf_calls, std::memory_order_relaxed);
+   gInnerDistFromIN.fetch_add(innerCtr, std::memory_order_relaxed);
    return local_step;
 }
 
@@ -978,7 +1033,9 @@ bool TGeoTessellated::Contains(Double_t const *point) const
    using Node = bvh::v2::Node<Scalar, 3>;
    using Bvh = bvh::v2::Bvh<Node>;
    using Ray = bvh::v2::Ray<Scalar, 3>;
-
+   int intersection_counter = 0;
+   int leaf_counter = 0;
+   int innerCounter = 0;
    // let's fetch the bvh
    auto mybvh = (Bvh *)fBVH;
    if (!mybvh) {
@@ -1014,19 +1071,26 @@ bool TGeoTessellated::Contains(Double_t const *point) const
    // Traverse the BVH and apply concrete object intersection in BVH leafs
    bvh::v2::GrowingStack<Bvh::Index> stack;
    size_t crossings = 0;
-   mybvh->intersect<false, use_robust_traversal>(ray, mybvh->get_root().index, stack, [&](size_t begin, size_t end) {
-      for (size_t prim_id = begin; prim_id < end; ++prim_id) {
-         auto objectid = mybvh->prim_ids[prim_id];
-         auto &facet = fFacets[objectid];
+   mybvh->intersect<false, use_robust_traversal>(
+      ray, mybvh->get_root().index, stack,
+      [&](size_t begin, size_t end) {
+         leaf_counter += 1;
+         for (size_t prim_id = begin; prim_id < end; ++prim_id) {
+            intersection_counter += 1;
+            auto objectid = mybvh->prim_ids[prim_id];
+            auto &facet = fFacets[objectid];
 
-         // for the parity test, we probe all crossing surfaces
-         if (rayFacetHit(Vertex_t(point[0], point[1], point[2]), test_dir, facet, fVertices, 0.)) {
-            ++crossings;
+            // for the parity test, we probe all crossing surfaces
+            if (rayFacetHit(Vertex_t(point[0], point[1], point[2]), test_dir, facet, fVertices, 0.)) {
+               ++crossings;
+            }
          }
-      }
-      return false;
-   });
-
+         return false;
+      },
+      [&innerCounter](const Node &, const Node &) { innerCounter += 1; });
+   gContainsFacetIntersections.fetch_add(intersection_counter, std::memory_order_relaxed);
+   gLeafContains.fetch_add(leaf_counter, std::memory_order_relaxed);
+   gInnerContains.fetch_add(innerCounter, std::memory_order_relaxed);
    return crossings & 1;
 }
 

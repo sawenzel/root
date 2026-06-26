@@ -33,7 +33,10 @@ query transparently falls back to the robust BVH navigation of the base class.
 #include <embree4/rtcore.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -41,6 +44,25 @@ query transparently falls back to the robust BVH navigation of the base class.
 ClassImp(TGeoTessellatedEmbree);
 
 namespace {
+
+// Benchmark counters: total number of per-facet double-precision rechecks
+// performed in user space, aggregated across all queries (Embree's internal
+// single-precision triangle tests are not observable here). A cheap local int is
+// accumulated per query and added once per call, so the hot loop is not slowed
+// down by atomics. The totals are printed at program exit.
+std::atomic<unsigned long long> gContainsFacetIntersections{0};
+std::atomic<unsigned long long> gDistFromInsideFacetIntersections{0};
+std::atomic<unsigned long long> gDistFromOutsideFacetIntersections{0};
+
+struct FacetIntersectionStatsDumper {
+   ~FacetIntersectionStatsDumper()
+   {
+      std::cerr << "[TGeoTessellatedEmbree] total facet intersections:"
+                << " Contains=" << gContainsFacetIntersections.load()
+                << " DistFromOutside=" << gDistFromOutsideFacetIntersections.load()
+                << " DistFromInside=" << gDistFromInsideFacetIntersections.load() << std::endl;
+   }
+} gFacetIntersectionStatsDumper;
 
 // Singleton Embree device shared within the process.
 RTCDevice GetEmbreeDevice()
@@ -207,8 +229,8 @@ void TGeoTessellatedEmbree::BuildEmbreeGeometry()
    const int nvertices = 3 * ntri;
    auto *ev = (EVertex *)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, sizeof(EVertex),
                                                  nvertices);
-   auto *et = (ETriangle *)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, sizeof(ETriangle),
-                                                   ntri);
+   auto *et =
+      (ETriangle *)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, sizeof(ETriangle), ntri);
 
    fEmbreePrimToFacet.clear();
    fEmbreePrimToFacet.reserve(ntri);
@@ -252,7 +274,7 @@ void TGeoTessellatedEmbree::BuildEmbreeGeometry()
 /// DistFromInside using Embree.
 
 Double_t TGeoTessellatedEmbree::DistFromInside(const Double_t *point, const Double_t *dir, Int_t iact, Double_t stepmax,
-                                              Double_t *safe) const
+                                               Double_t *safe) const
 {
    auto scene = (RTCScene)fEmbreeScene;
 
@@ -284,9 +306,14 @@ Double_t TGeoTessellatedEmbree::DistFromInside(const Double_t *point, const Doub
    const Vertex_t p{point[0], point[1], point[2]};
    const Vertex_t d{dir[0], dir[1], dir[2]};
 
+   // benchmark counter: per-facet double-precision rechecks performed in user space
+   // (Embree's internal single-precision triangle tests are not observable here).
+   int intersection_counter = 0;
+
    double dist = Big();
    bool confirmed = false;
    for (int primID : candidates) {
+      ++intersection_counter;
       const int f = fEmbreePrimToFacet[primID];
       // only exiting surfaces are relevant (from inside the dot product is positive)
       if (normals[f].Dot(d) <= 0.)
@@ -306,6 +333,7 @@ Double_t TGeoTessellatedEmbree::DistFromInside(const Double_t *point, const Doub
          const int nv = facet.GetNvert();
          for (int vi = 0; vi < nv; ++vi) {
             for (int nb : fVertexIdToFacets[facet[vi]]) {
+               ++intersection_counter;
                if (nb == cand || normals[nb].Dot(d) <= 0.)
                   continue;
                const double t = rayFacet(p, d, facets[nb], vertices, 0.);
@@ -316,14 +344,15 @@ Double_t TGeoTessellatedEmbree::DistFromInside(const Double_t *point, const Doub
       }
    }
 
+   gDistFromInsideFacetIntersections.fetch_add(intersection_counter, std::memory_order_relaxed);
    return dist;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 /// DistFromOutside using Embree.
 
-Double_t TGeoTessellatedEmbree::DistFromOutside(const Double_t *point, const Double_t *dir, Int_t iact, Double_t stepmax,
-                                               Double_t *safe) const
+Double_t TGeoTessellatedEmbree::DistFromOutside(const Double_t *point, const Double_t *dir, Int_t iact,
+                                                Double_t stepmax, Double_t *safe) const
 {
    // Quickly approach the solid using the bounding box, so that the Embree query
    // starts close to the surface (better single precision behaviour).
@@ -370,9 +399,14 @@ Double_t TGeoTessellatedEmbree::DistFromOutside(const Double_t *point, const Dou
    const Vertex_t p{cpoint[0], cpoint[1], cpoint[2]};
    const Vertex_t d{dir[0], dir[1], dir[2]};
 
+   // benchmark counter: per-facet double-precision rechecks performed in user space
+   // (Embree's internal single-precision triangle tests are not observable here).
+   int intersection_counter = 0;
+
    double dist = Big();
    bool confirmed = false;
    for (int primID : candidates) {
+      ++intersection_counter;
       const int f = fEmbreePrimToFacet[primID];
       // only entering surfaces are relevant (from outside the dot product is negative)
       if (normals[f].Dot(d) > 0.)
@@ -392,6 +426,7 @@ Double_t TGeoTessellatedEmbree::DistFromOutside(const Double_t *point, const Dou
          const int nv = facet.GetNvert();
          for (int vi = 0; vi < nv; ++vi) {
             for (int nb : fVertexIdToFacets[facet[vi]]) {
+               ++intersection_counter;
                if (nb == cand || normals[nb].Dot(d) > 0.)
                   continue;
                const double t = rayFacet(p, d, facets[nb], vertices, 0.);
@@ -402,6 +437,7 @@ Double_t TGeoTessellatedEmbree::DistFromOutside(const Double_t *point, const Dou
       }
    }
 
+   gDistFromOutsideFacetIntersections.fetch_add(intersection_counter, std::memory_order_relaxed);
    return dist + offset;
 }
 
@@ -451,11 +487,17 @@ bool TGeoTessellatedEmbree::Contains(const Double_t *point) const
    const auto &vertices = GetVertices();
    const Vertex_t p{point[0], point[1], point[2]};
 
+   // benchmark counter: per-facet double-precision rechecks performed in user space
+   // (Embree's internal single-precision triangle tests are not observable here).
+   int intersection_counter = 0;
+
    int crossings = 0;
    for (int f : facetHits) {
+      ++intersection_counter;
       if (rayFacetHit(p, test_dir, facets[f], vertices, 0.))
          ++crossings;
    }
+   gContainsFacetIntersections.fetch_add(intersection_counter, std::memory_order_relaxed);
    return crossings & 1;
 }
 
@@ -464,6 +506,29 @@ bool TGeoTessellatedEmbree::Contains(const Double_t *point) const
 
 Double_t TGeoTessellatedEmbree::Safety(const Double_t *point, Bool_t /*in*/) const
 {
+   // (a) "Stop short" for points outside the bounding box: return the safety to
+   // the outer box, a conservative underestimate of the true safety (the closest
+   // facet can never be nearer than the box). This mirrors the top-node early-out
+   // of the base TGeoTessellated::SafetyKernel and avoids descending the BVH for
+   // points that are anyway far from the surface. The Euclidean distance to the
+   // box is used so the estimate matches the base kernel exactly.
+   //
+   // TODO(b): the base SafetyKernel can additionally stop at *intermediate* BVH
+   // nodes (returning a coarse bbox underestimate when a subtree is farther than a
+   // threshold). That node-level early-stop cannot be expressed through Embree's
+   // rtcPointQuery, which only calls back at the leaf/primitive level. To gain it
+   // here, Safety would have to be routed through an estimating base SafetyKernel
+   // instead of the Embree closest-point query (see analysis).
+   if (!TGeoBBox::Contains(point)) {
+      double d2 = 0.;
+      const double dd[3] = {std::fabs(point[0] - fOrigin[0]) - fDX, std::fabs(point[1] - fOrigin[1]) - fDY,
+                            std::fabs(point[2] - fOrigin[2]) - fDZ};
+      for (double q : dd)
+         if (q > 0.)
+            d2 += q * q;
+      return std::sqrt(d2);
+   }
+
    struct ClosestPointContext {
       float minDist2;
       RTCGeometry geom;
@@ -483,10 +548,9 @@ Double_t TGeoTessellatedEmbree::Safety(const Double_t *point, Bool_t /*in*/) con
       const float *v1 = vertices + 3 * i1;
       const float *v2 = vertices + 3 * i2;
 
-      const float dist2 =
-         pointTriangleDistSq(Vec3f<float>(args->query->x, args->query->y, args->query->z),
-                             Vec3f<float>(v0[0], v0[1], v0[2]), Vec3f<float>(v1[0], v1[1], v1[2]),
-                             Vec3f<float>(v2[0], v2[1], v2[2]));
+      const float dist2 = pointTriangleDistSq(Vec3f<float>(args->query->x, args->query->y, args->query->z),
+                                              Vec3f<float>(v0[0], v0[1], v0[2]), Vec3f<float>(v1[0], v1[1], v1[2]),
+                                              Vec3f<float>(v2[0], v2[1], v2[2]));
 
       if (dist2 < ctx->minDist2) {
          ctx->minDist2 = dist2;
